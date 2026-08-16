@@ -1,7 +1,7 @@
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
 import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
-import crypto from "node:crypto";
+import crypto from "crypto";
 import { resolveSessionId } from "../utils/sessionManager.js";
 
 // OpenCode free tier limits requests per egress IP.
