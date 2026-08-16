@@ -108,10 +108,18 @@ function npmInstall(pkgs, opts = {}) {
 // built-in. This is purely a *speed optimization* — app works without
 // better-sqlite3 via fallbacks.
 function isSqlJsWasmValid() {
-  const bundledWasm = path.join(__dirname, "..", "app", "node_modules", "sql.js", "dist", "sql-wasm.wasm");
-  if (fs.existsSync(bundledWasm)) return true;
+  const appDir = path.join(__dirname, "..", "app");
+  const bundledWasmPaths = getBundledWasmPaths(appDir);
+  if (bundledWasmPaths.some((file) => fs.existsSync(file))) return true;
   const runtimeWasm = path.join(getRuntimeNodeModules(), "sql.js", "dist", "sql-wasm.wasm");
   return fs.existsSync(runtimeWasm);
+}
+
+function getBundledWasmPaths(appDir = path.join(__dirname, "..", "app")) {
+  return [
+    path.join(appDir, "_nm", "sql.js", "dist", "sql-wasm.wasm"),
+    path.join(appDir, "node_modules", "sql.js", "dist", "sql-wasm.wasm"),
+  ];
 }
 
 function ensureSqliteRuntime({ silent = false } = {}) {
@@ -137,12 +145,19 @@ function ensureSqliteRuntime({ silent = false } = {}) {
 }
 
 // Inject runtime + bundled node_modules into NODE_PATH so child Node processes
-// resolve sql.js (bundled in bin/app/node_modules) and better-sqlite3 (runtime).
+// resolve sql.js (bundled in bin/app/_nm) and better-sqlite3 (runtime).
 function buildEnvWithRuntime(baseEnv = process.env) {
   const runtimeNm = getRuntimeNodeModules();
-  const bundledNm = path.join(__dirname, "..", "app", "node_modules");
+  const appDir = path.join(__dirname, "..", "app");
+  const bundledNm = fs.existsSync(path.join(appDir, "_nm"))
+    ? path.join(appDir, "_nm")
+    : path.join(appDir, "node_modules");
   const existing = baseEnv.NODE_PATH || "";
-  const NODE_PATH = [runtimeNm, bundledNm, existing].filter(Boolean).join(path.delimiter);
+  const bundledIsValid = getBundledWasmPaths(appDir).some((file) => fs.existsSync(file));
+  const NODE_PATH = [
+    ...(bundledIsValid ? [bundledNm, runtimeNm] : [runtimeNm, bundledNm]),
+    existing,
+  ].filter(Boolean).join(path.delimiter);
   return { ...baseEnv, NODE_PATH };
 }
 
