@@ -105,6 +105,10 @@ pnpm test tests/unit/        # Unit tests only
 pnpm test tests/translator/  # Translator tests
 ```
 
+## Release CI/CD
+
+Release/tag/deploy rules are mandatory: read [`.agent/cicd.md`](./.agent/cicd.md) before changing release files, bumping versions, updating `CHANGELOG.md`, creating tags, or deploying production.
+
 ## Important Files
 
 | File | Purpose |

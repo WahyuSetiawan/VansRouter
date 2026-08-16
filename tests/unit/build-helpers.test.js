@@ -4,7 +4,7 @@ import path from "path";
 import os from "os";
 
 const require = createRequire(import.meta.url);
-const { ensureModuleInBundle, copyRecursive } = require("../../cli/scripts/build-cli.js");
+const { ensureModuleInBundle, stripBundledPackage, copyRecursive } = require("../../cli/scripts/build-cli.js");
 
 /**
  * Creates a directory symbolic link in a Windows-safe way.
@@ -137,6 +137,44 @@ describe("build-helpers", () => {
     spy.mockRestore();
 
     expect(fs.readdirSync(destDir)).toEqual(["package.json"]);
+  });
+
+  it("copies a package again when a required asset is missing", () => {
+    const appDir = path.join(tmpDir, "app");
+    const rootDir = path.join(tmpDir, "root");
+    const cliAppDir = path.join(tmpDir, "cli", "app");
+    const sourceDir = path.join(appDir, "node_modules", "sql.js");
+    const destDir = path.join(cliAppDir, "node_modules", "sql.js");
+    fs.mkdirSync(sourceDir, { recursive: true });
+    fs.mkdirSync(destDir, { recursive: true });
+    fs.writeFileSync(path.join(sourceDir, "package.json"), JSON.stringify({ name: "sql.js" }));
+    fs.writeFileSync(path.join(sourceDir, "sql-wasm.wasm"), "wasm");
+    fs.writeFileSync(path.join(destDir, "package.json"), JSON.stringify({ name: "sql.js" }));
+
+    ensureModuleInBundle("sql.js", {
+      cliAppDir,
+      appDir,
+      rootDir,
+      copyRecursive,
+      requiredFiles: ["sql-wasm.wasm"],
+    });
+
+    expect(fs.readFileSync(path.join(destDir, "sql-wasm.wasm"), "utf8")).toBe("wasm");
+  });
+
+  it("strips direct and pnpm virtual-store package copies", () => {
+    const cliAppDir = path.join(tmpDir, "cli", "app");
+    const direct = path.join(cliAppDir, "node_modules", "better-sqlite3");
+    const virtual = path.join(cliAppDir, "node_modules", ".pnpm", "better-sqlite3@1", "node_modules", "better-sqlite3");
+    const renamedVirtual = path.join(cliAppDir, "_nm", ".pnpm", "better-sqlite3@2", "node_modules", "better-sqlite3");
+    fs.mkdirSync(direct, { recursive: true });
+    fs.mkdirSync(virtual, { recursive: true });
+    fs.mkdirSync(renamedVirtual, { recursive: true });
+
+    expect(stripBundledPackage(cliAppDir, "better-sqlite3")).toBe(true);
+    expect(fs.existsSync(direct)).toBe(false);
+    expect(fs.existsSync(virtual)).toBe(false);
+    expect(fs.existsSync(renamedVirtual)).toBe(false);
   });
 
   it("warns when the package cannot be resolved", () => {

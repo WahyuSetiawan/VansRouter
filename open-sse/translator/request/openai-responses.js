@@ -269,19 +269,25 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
     store: false
   };
 
-  // Extract system message as instructions
+  // Extract system message as instructions and keep inside result.input as role="developer"
+  // OpenAI prompt caching matches on the serialized prefix of the input array (+ tools).
+  // Keeping system/developer prompts in input keeps them in the cacheable prefix (>1024 tokens).
   let hasSystemMessage = false;
   const messages = body.messages || [];
 
   for (const msg of messages) {
     if (msg.role === ROLE.SYSTEM || msg.role === ROLE.DEVELOPER) {
-      // Use the first instruction-bearing message as instructions.
-      // OpenAI recommends role="developer" for GPT-5/Codex as the system-level prompt.
       if (!hasSystemMessage) {
         result.instructions = typeof msg.content === "string" ? msg.content : "";
         hasSystemMessage = true;
       }
-      continue; // Skip instruction messages in input
+      const text = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "");
+      result.input.push({
+        type: "message",
+        role: "developer",
+        content: [{ type: RESPONSES_ITEM.INPUT_TEXT, text }]
+      });
+      continue;
     }
 
     // Convert user/assistant messages to input items

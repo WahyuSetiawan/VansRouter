@@ -4,7 +4,10 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   GHCR_IMAGE: ghcr.io/vanszs/vansrouter
@@ -14,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       is-main: ${{ steps.check.outputs.is-main }}
+      version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,18 +27,23 @@ jobs:
         id: check
         run: |
           git fetch origin main
-          if git merge-base --is-ancestor HEAD origin/main; then
+          git fetch origin "refs/tags/$GITHUB_REF_NAME:refs/tags/release-validation"
+          if test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"; then
             echo "is-main=true" >> "$GITHUB_OUTPUT"
-            echo "✅ Release target is on main"
+            echo "✅ Release target is the current main commit"
           else
             echo "is-main=false" >> "$GITHUB_OUTPUT"
-            echo "⛔ Release skipped: tag is not on main"
+            echo "⛔ Release blocked: tag must point to the current main commit"
+            exit 1
           fi
 
-  build-and-push-ghcr:
+          RELEASE_TAG_REF=refs/tags/release-validation node cli/scripts/validate-release.cjs "$GITHUB_REF_NAME"
+
+  build-and-verify-ghcr:
     needs: check-branch
     if: needs.check-branch.outputs.is-main == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       actions: write
       contents: read
@@ -52,22 +61,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.GHCR_IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and push
+      - name: Build and push staging image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ env.GHCR_IMAGE }}:release-${{ github.run_id }}-${{ github.run_attempt }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-from: type=gha,scope=release
           cache-to: type=gha,scope=release,mode=max,ignore-error=true,timeout=5m
@@ -77,23 +76,23 @@ jobs:
 
       - name: Verify multi-platform manifest
         run: |
-          docker buildx imagetools inspect "${{ env.GHCR_IMAGE }}:${{ steps.meta.outputs.version }}" | tee /tmp/image-manifest.txt
+          docker buildx imagetools inspect "${{ env.GHCR_IMAGE }}:release-${{ github.run_id }}-${{ github.run_attempt }}" | tee /tmp/image-manifest.txt
           grep -q 'linux/amd64' /tmp/image-manifest.txt
           grep -q 'linux/arm64' /tmp/image-manifest.txt
 
       - name: Verify native SQLite in image
         run: |
-          docker pull "${{ env.GHCR_IMAGE }}:${{ steps.meta.outputs.version }}"
-          docker run --rm "${{ env.GHCR_IMAGE }}:${{ steps.meta.outputs.version }}" \
+          docker pull "${{ env.GHCR_IMAGE }}:release-${{ github.run_id }}-${{ github.run_attempt }}"
+          docker run --rm "${{ env.GHCR_IMAGE }}:release-${{ github.run_id }}-${{ github.run_attempt }}" \
             node -e "const D=require('better-sqlite3'); const db=new D(':memory:'); if (db.prepare('SELECT 1 AS ok').get().ok !== 1) process.exit(1); db.close(); console.log('native SQLite OK')"
 
-  publish-npm:
+  package-npm:
     needs: check-branch
     if: needs.check-branch.outputs.is-main == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -105,8 +104,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org/
+          node-version: 22.14.0
 
       - name: Configure pnpm hoisting config
         shell: bash
@@ -117,14 +115,96 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Upgrade npm for trusted publishing
-        run: npm install --global npm@latest
-
       - name: Install CLI package devDependencies
-        # cli/ is not in pnpm-workspace.yaml, so its devDependencies (esbuild)
-        # are not installed by `pnpm install`. Install them here so the CLI
-        # build script (which requires esbuild) can run.
+        # cli/ is outside the pnpm workspace; install its build dependency explicitly.
         run: npm install --prefix cli --no-audit --no-fund
 
-      - name: Build and publish CLI package
-        run: npm publish ./cli --provenance
+      - name: Build and pack CLI package
+        id: pack
+        run: |
+          npm run build --prefix cli
+          npm pack ./cli --pack-destination "$RUNNER_TEMP"
+          printf 'tarball=%s\n' "$RUNNER_TEMP/vansrouter-${{ needs.check-branch.outputs.version }}.tgz" >> "$GITHUB_OUTPUT"
+
+      - name: Validate final CLI tarball
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+          RELEASE_VERSION: ${{ needs.check-branch.outputs.version }}
+        run: node cli/scripts/validate-package.cjs "$TARBALL" "$RELEASE_VERSION"
+
+      - name: Smoke-test extracted CLI artifact without network
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+          RELEASE_VERSION: ${{ needs.check-branch.outputs.version }}
+        run: node cli/scripts/smoke-package.cjs "$TARBALL" "$RELEASE_VERSION"
+
+      - name: Upload validated CLI tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-package-${{ needs.check-branch.outputs.version }}
+          path: ${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-npm:
+    needs: [check-branch, package-npm, build-and-verify-ghcr]
+    if: needs.check-branch.outputs.is-main == 'true' && needs.package-npm.result == 'success' && needs.build-and-verify-ghcr.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.14.0
+          registry-url: https://registry.npmjs.org/
+
+      - name: Install npm trusted publishing client
+        run: npm install --global npm@11.5.1
+
+      - name: Download validated CLI tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-package-${{ needs.check-branch.outputs.version }}
+          path: ${{ runner.temp }}/npm-package
+
+      - name: Revalidate downloaded CLI tarball
+        env:
+          RELEASE_VERSION: ${{ needs.check-branch.outputs.version }}
+        run: node cli/scripts/validate-package.cjs "$RUNNER_TEMP/npm-package/vansrouter-${RELEASE_VERSION}.tgz" "$RELEASE_VERSION"
+
+      - name: Publish validated CLI tarball
+        env:
+          RELEASE_VERSION: ${{ needs.check-branch.outputs.version }}
+        run: npm publish "$RUNNER_TEMP/npm-package/vansrouter-${RELEASE_VERSION}.tgz" --provenance
+
+  promote-ghcr:
+    needs: [check-branch, publish-npm, build-and-verify-ghcr]
+    if: needs.check-branch.outputs.is-main == 'true' && needs.publish-npm.result == 'success' && needs.build-and-verify-ghcr.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Promote verified image
+        env:
+          STAGING_IMAGE: ${{ env.GHCR_IMAGE }}:release-${{ github.run_id }}-${{ github.run_attempt }}
+          RELEASE_IMAGE: ${{ env.GHCR_IMAGE }}:${{ needs.check-branch.outputs.version }}
+          LATEST_IMAGE: ${{ env.GHCR_IMAGE }}:latest
+        run: |
+          docker buildx imagetools create --tag "$RELEASE_IMAGE" "$STAGING_IMAGE"
+          docker buildx imagetools create --tag "$LATEST_IMAGE" "$STAGING_IMAGE"

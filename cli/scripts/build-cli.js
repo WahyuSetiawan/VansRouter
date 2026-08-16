@@ -79,9 +79,10 @@ function ensureModuleInBundle(pkg, options = {}) {
   const appDir = options.appDir;
   const rootDir = options.rootDir;
   const copyRecursiveFn = options.copyRecursive || copyRecursive;
+  const requiredFiles = options.requiredFiles || [];
 
   const dest = path.join(cliAppDir, "node_modules", pkg);
-  if (fs.existsSync(dest)) {
+  if (fs.existsSync(dest) && requiredFiles.every((file) => fs.existsSync(path.join(dest, file)))) {
     console.log(`✅ ${pkg} already bundled`);
     return;
   }
@@ -110,7 +111,32 @@ function ensureModuleInBundle(pkg, options = {}) {
   console.log(`✅ Bundled ${pkg}`);
 }
 
-module.exports = { ensureModuleInBundle, copyRecursive, shouldExclude, EXCLUDE_PATTERNS };
+function stripBundledPackage(cliAppDir, pkg) {
+  const candidates = [];
+  const virtualStores = [];
+  for (const nodeModules of ["node_modules", "_nm"]) {
+    const root = path.join(cliAppDir, nodeModules);
+    candidates.push(path.join(root, pkg));
+    virtualStores.push(path.join(root, ".pnpm"));
+  }
+
+  for (const virtualStore of virtualStores) {
+    if (!fs.existsSync(virtualStore)) continue;
+    for (const entry of fs.readdirSync(virtualStore, { withFileTypes: true })) {
+      if (entry.isDirectory()) candidates.push(path.join(virtualStore, entry.name, "node_modules", pkg));
+    }
+  }
+
+  let removed = false;
+  for (const candidate of candidates) {
+    if (!fs.existsSync(candidate)) continue;
+    fs.rmSync(candidate, { recursive: true, force: true });
+    removed = true;
+  }
+  return removed;
+}
+
+module.exports = { ensureModuleInBundle, stripBundledPackage, copyRecursive, shouldExclude, EXCLUDE_PATTERNS };
 
 if (require.main === module) {
   const cliDir = path.resolve(__dirname, "..");
@@ -216,12 +242,20 @@ if (require.main === module) {
   // Windows EBUSY during global CLI updates. node:sqlite (Node ≥22.5) is also
   // available as a no-install middle tier.
   console.log("3️⃣ b Configuring SQLite drivers...");
-  ensureModuleInBundle("sql.js", { cliAppDir, appDir, rootDir, copyRecursive });
+  ensureModuleInBundle("sql.js", {
+    cliAppDir,
+    appDir,
+    rootDir,
+    copyRecursive,
+    requiredFiles: ["dist/sql-wasm.wasm"],
+  });
+  // Next's standalone trace can omit these when the CLI package is built from
+  // the workspace root; the published server still requires them at startup.
+  ensureModuleInBundle("react", { cliAppDir, appDir, rootDir, copyRecursive });
+  ensureModuleInBundle("react-dom", { cliAppDir, appDir, rootDir, copyRecursive });
   ensureModuleInBundle("@swc/helpers", { cliAppDir, appDir, rootDir, copyRecursive });
   ensureModuleInBundle("@next/env", { cliAppDir, appDir, rootDir, copyRecursive });
-  const betterDir = path.join(cliAppDir, "node_modules", "better-sqlite3");
-  if (fs.existsSync(betterDir)) {
-    fs.rmSync(betterDir, { recursive: true, force: true });
+  if (stripBundledPackage(cliAppDir, "better-sqlite3")) {
     console.log("✅ Stripped better-sqlite3 (lives in ~/.9router/runtime)");
   }
   console.log("");

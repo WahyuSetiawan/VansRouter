@@ -395,7 +395,27 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     strictProxy: psd?.strictProxy === true || provider === "freebuff",
     proxyPoolId: psd?.proxyPoolId || psd?.connectionProxyPoolId || null,
   });
+  const proxyScope = `${provider}::${model}`;
   let proxyOptions = buildProxyOptions(credentials?.providerSpecificData || {});
+
+  if (provider === "freebuff" && credentials?.providerSpecificData?.noFitPool === true) {
+    const error = new Error(`Freebuff has no healthy proxy pool for ${model}; all assigned pools are cooling down after limited-IP errors.`);
+    error.status = 503;
+    error.poolScoped = { poolId: null, scope: proxyScope, reason: "no_fit_pool" };
+    trackPendingRequest(model, provider, connectionId, false, true);
+    return createErrorResult(503, error.message);
+  }
+
+  if (
+    provider === "freebuff" &&
+    !proxyOptions.vercelRelayUrl &&
+    !(proxyOptions.connectionProxyEnabled && proxyOptions.connectionProxyUrl)
+  ) {
+    const error = new Error(`Freebuff requires a configured proxy pool for ${model}; direct egress is disabled to prevent limited-IP rate limits.`);
+    error.status = 503;
+    trackPendingRequest(model, provider, connectionId, false, true);
+    return createErrorResult(503, error.message);
+  }
 
   if (proxyOptions.vercelRelayUrl) {
     const connectionName = credentials?.connectionName || credentials?.connectionId || "unknown";
@@ -423,7 +443,6 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     log?.debug?.("PROXY", `${provider.toUpperCase()} | ${model} | conn=${connectionName} | no_proxy=${proxyOptions.connectionNoProxy}`);
   }
 
-  const proxyScope = `${provider}::${model}`;
   let parsedNonOk = null;
   const executeWithPoolFallback = async (attempt = 0) => {
     let result;
