@@ -124,5 +124,7 @@ export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, 
     connectionId: connectionId || undefined,
     apiKey: apiKey || undefined,
     endpoint: endpoint || null
-  }).catch(() => {});
+  }).catch(err => {
+    console.error("[UsageStats] Failed to save usage:", err?.message || err);
+  });
 }

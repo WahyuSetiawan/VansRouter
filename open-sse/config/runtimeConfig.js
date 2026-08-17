@@ -55,6 +55,18 @@ export const STREAM_FIRST_CHUNK_TIMEOUT_MS = envMs("STREAM_FIRST_CHUNK_TIMEOUT_M
 // Fetch connect timeout: abort if upstream doesn't return response headers within this duration
 export const FETCH_CONNECT_TIMEOUT_MS = envMs("FETCH_CONNECT_TIMEOUT_MS", 60 * 1000);
 
+// Idle keepalive interval for chat streaming: a SSE comment is sent every
+// N ms while no data chunk flows, so idle observers (nginx proxy_read_timeout,
+// client read timeout, LB) don't kill the connection during silent thinking.
+// Env: STREAM_KEEPALIVE_INTERVAL_MS.
+export const STREAM_KEEPALIVE_INTERVAL_MS = envMs("STREAM_KEEPALIVE_INTERVAL_MS", 15 * 1000);
+
+// Streaming point: bounds how long the readiness-gate peek awaits the first
+// upstream chunk before returning the Response to the client, so a slow-to-start
+// upstream does not hold the client's HTTP headers hostage for the full TTFT.
+// Env: STREAM_READINESS_PEEK_TIMEOUT_MS.
+export const STREAM_READINESS_PEEK_TIMEOUT_MS = envMs("STREAM_READINESS_PEEK_TIMEOUT_MS", 500);
+
 // Gemini native TTS fetch timeout: abort if Google does not return response headers in time.
 export const GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS = envMs("GEMINI_NATIVE_TTS_FETCH_TIMEOUT_MS", 45 * 1000);
 

@@ -33,6 +33,7 @@ import { updateProviderConnection, getProviderConnections } from "@/lib/localDb"
 import { isModelAllowed } from "../services/allowedModels.js";
 import { cacheClaudeHeaders } from "open-sse/utils/claudeHeaderCache.js";
 import { getSettings } from "@/lib/localDb";
+import { FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
 import { DEFAULT_HEADROOM_URL } from "@/lib/headroom/detect";
@@ -163,7 +164,7 @@ export async function handleChat(request, clientRawRequest = null) {
             const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
             cleanRawReq = { ...clientRawRequest, body: cleanBody };
           }
-          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, apiKeyInfo);
+          return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, apiKeyInfo, null, settings);
         },
         log,
         comboName: modelStr,
@@ -177,7 +178,7 @@ export async function handleChat(request, clientRawRequest = null) {
     return handleComboChat({
       body,
       models: comboModels,
-      handleSingleModel: (b, m, opts) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, apiKeyInfo, opts),
+      handleSingleModel: (b, m, opts) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, apiKeyInfo, opts, settings),
       log,
       comboName: modelStr,
       comboStrategy,
@@ -189,13 +190,13 @@ export async function handleChat(request, clientRawRequest = null) {
   }
 
   // Single model request
-  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, apiKeyInfo);
+  return handleSingleModelChat(body, modelStr, clientRawRequest, request, apiKey, apiKeyInfo, null, settings);
 }
 
 /**
  * Handle single model chat request
  */
-async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, apiKeyInfo = null, options = null) {
+async function handleSingleModelChat(body, modelStr, clientRawRequest = null, request = null, apiKey = null, apiKeyInfo = null, options = null, settings = null) {
   const externalSignal = options?.signal ?? null;
   const clientSignal = request?.signal && externalSignal
     ? AbortSignal.any([request.signal, externalSignal])
@@ -206,7 +207,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   if (!modelInfo.provider) {
     const comboModels = await getComboModels(modelStr);
     if (comboModels) {
-      const chatSettings = await getSettings();
+      const chatSettings = settings || await getSettings();
       // Check for combo-specific strategy first, fallback to global
       const comboStrategies = chatSettings.comboStrategies || {};
       const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
@@ -223,7 +224,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
               const { tools, tool_choice, ...cleanBody } = clientRawRequest.body || {};
               cleanRawReq = { ...clientRawRequest, body: cleanBody };
             }
-            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, apiKeyInfo);
+            return handleSingleModelChat(b, m, cleanRawReq, request, apiKey, apiKeyInfo, null, chatSettings);
           },
           log,
           comboName: modelStr,
@@ -237,7 +238,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
       return handleComboChat({
         body,
         models: comboModels,
-        handleSingleModel: (b, m, opts) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, apiKeyInfo, opts),
+        handleSingleModel: (b, m, opts) => handleSingleModelChat(b, m, clientRawRequest, request, apiKey, apiKeyInfo, opts, chatSettings),
         log,
         comboName: modelStr,
         comboStrategy,
@@ -280,7 +281,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   const userAgent = request?.headers?.get("user-agent") || "";
   const preferredConnectionId = request?.headers?.get("x-connection-id") || null;
 
-  const chatSettings = await getSettings();
+  const chatSettings = settings || await getSettings();
   const circuitBreakerEnabled = chatSettings.circuitBreakerEnabled !== false && chatSettings.circuitBreakerEnabled !== 0;
 
   // Pipeline gate: check circuit breaker state BEFORE credential lookup.
@@ -304,12 +305,16 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
   // Count configured accounts for this provider so chatCore can cap per-account
   // retries: more accounts → fail faster and fall back to the next account.
+  // Skip the DB read for noAuth providers (e.g. opencode) — no connections to
+  // count, and it trims SQLite contention when many sessions share the provider.
   let providerAccountCount = 0;
-  try {
-    const allProviderConnections = await getProviderConnections({ provider });
-    providerAccountCount = allProviderConnections?.length || 0;
-  } catch (e) {
-    log?.warn?.("AUTH", `Failed to count provider connections for ${provider}: ${e.message}`);
+  if (!FREE_PROVIDERS[provider]?.noAuth) {
+    try {
+      const allProviderConnections = await getProviderConnections({ provider });
+      providerAccountCount = allProviderConnections?.length || 0;
+    } catch (e) {
+      log?.warn?.("AUTH", `Failed to count provider connections for ${provider}: ${e.message}`);
+    }
   }
 
   // Try with available accounts (fallback on errors)

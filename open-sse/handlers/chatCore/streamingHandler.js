@@ -4,11 +4,12 @@ import { createSSETransformStreamWithLogger, createPassthroughStreamWithLogger }
 import { normalizeKimiToolCalls } from "../../utils/kimiToolParser.js";
 import { pipeWithDisconnect } from "../../utils/streamHandler.js";
 import { PROVIDERS } from "../../config/providers.js";
-import { STREAM_STALL_TIMEOUT_MS } from "../../config/runtimeConfig.js";
+import { STREAM_STALL_TIMEOUT_MS, STREAM_READINESS_PEEK_TIMEOUT_MS } from "../../config/runtimeConfig.js";
+import { STREAM_KEEPALIVE_INTERVAL_MS } from "../../config/runtimeConfig.js";
 import { buildAbortedResponsesTerminalBytes } from "../../utils/responsesStreamHelpers.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats } from "./requestDetail.js";
 import { saveRequestDetail } from "@/lib/usageDb.js";
-import { SSE_HEADERS_CORS as SSE_HEADERS } from "../../utils/sseConstants.js";
+import { SSE_HEADERS_CORS as SSE_HEADERS, SSE_KEEPALIVE_COMMENT } from "../../utils/sseConstants.js";
 
 const STREAM_EARLY_EOF_STATUS = 502;
 
@@ -18,34 +19,64 @@ const STREAM_EARLY_EOF_STATUS = 502;
  * Otherwise return the first chunk + the reader so the caller can
  * reconstruct a stream that still contains that first chunk.
  */
-async function peekStreamReadiness(body) {
+async function peekStreamReadiness(body, timeoutMs = STREAM_READINESS_PEEK_TIMEOUT_MS) {
   if (!body || typeof body.getReader !== "function") {
     return { empty: true };
   }
   const reader = body.getReader();
+  const readPromise = reader.read();
+  let timer = null;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => resolve("__readiness_timeout__"), timeoutMs);
+  });
   try {
-    const { done, value } = await reader.read();
-    if (done) {
+    const result = await Promise.race([readPromise, timeoutPromise]);
+    if (result === "__readiness_timeout__") {
+      // The initial read is still in flight — hand it to the reconstruct
+      // stream so it can await it without issuing a concurrent reader.read().
+      return { empty: false, firstChunk: null, reader, initialRead: readPromise, timedOut: true };
+    }
+    if (result.done) {
       return { empty: true };
     }
-    return { empty: false, firstChunk: value, reader };
+    return { empty: false, firstChunk: result.value, reader };
   } catch (error) {
     reader.cancel?.().catch(() => {});
     throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
 /**
  * Reconstruct a ReadableStream from a peeked first chunk + remaining reader.
  */
-function reconstructStream({ firstChunk, reader }) {
-  let enqueuedFirst = false;
+function reconstructStream({ firstChunk, reader, initialRead }) {
+  let first = true;
   return new ReadableStream({
     async pull(controller) {
-      if (!enqueuedFirst) {
-        controller.enqueue(firstChunk);
-        enqueuedFirst = true;
-        return;
+      if (first) {
+        first = false;
+        if (firstChunk) {
+          controller.enqueue(firstChunk);
+          return;
+        }
+        if (initialRead) {
+          try {
+            const { done, value } = await initialRead;
+            if (done) {
+              controller.close();
+              reader.releaseLock?.();
+            } else {
+              controller.enqueue(value);
+            }
+            return;
+          } catch (error) {
+            controller.error(error);
+            reader.cancel?.().catch(() => {});
+            return;
+          }
+        }
       }
       try {
         const { done, value } = await reader.read();
@@ -96,6 +127,40 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
   }
 
   return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, isKimiModel ? normalizeKimiToolCalls : null, responseModel);
+}
+
+/**
+ * Keepalive filter: injects an SSE comment every intervalMs while no data
+ * chunk flows, so idle proxies/LBs (nginx proxy_read_timeout, etc.) don't
+ * kill the connection during silent thinking. SSE comments (lines starting
+ * with ":") are ignored by all compliant clients — transparent.
+ *
+ * Sits OUTSIDE the SSE parser (after pipeWithDisconnect), so it never
+ * corrupts the translated stream.
+ */
+function createKeepAliveFilter(intervalMs = STREAM_KEEPALIVE_INTERVAL_MS) {
+  let timer = null;
+  const encoder = new TextEncoder();
+  const arm = (controller) => {
+    if (intervalMs <= 0) return;
+    timer = setTimeout(() => {
+      timer = null;
+      try {
+        controller.enqueue(encoder.encode(SSE_KEEPALIVE_COMMENT));
+      } catch { /* stream closed — stop heartbeating */ }
+      arm(controller);
+    }, intervalMs);
+    timer?.unref?.();
+  };
+  return new TransformStream({
+    transform(chunk, controller) {
+      clearTimeout(timer);
+      timer = null;
+      controller.enqueue(chunk);
+      arm(controller);
+    },
+    flush() { clearTimeout(timer); timer = null; }
+  });
 }
 
 /**
@@ -162,6 +227,10 @@ export async function handleStreamingResponse({
   });
   const transformedBody = pipeWithDisconnect(reconstructedResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs);
 
+  // Keepalive OUTSIDE the SSE parser: inject idle comments so proxies/LBs
+  // don't time out the connection while the model thinks silently.
+  const keepAliveBody = transformedBody.pipeThrough(createKeepAliveFilter());
+
   saveRequestDetail(buildRequestDetail({
     provider, model, connectionId, apiKey, apiKeyName,
     latency: { ttft: 0, total: Date.now() - requestStartTime },
@@ -178,7 +247,7 @@ export async function handleStreamingResponse({
 
   return {
     success: true,
-    response: new Response(transformedBody, { headers: SSE_HEADERS })
+    response: new Response(keepAliveBody, { headers: SSE_HEADERS })
   };
 }
 
