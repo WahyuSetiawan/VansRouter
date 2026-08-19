@@ -70,6 +70,7 @@ export function geminiToOpenAIResponse(chunk, state) {
             isThought ? reasoningDelta(part.text) : { content: part.text },
             null
           ));
+          if (!isThought) state.hasEmittedContent = true;
         }
         
         if (hasFunctionCall) {
@@ -88,6 +89,7 @@ export function geminiToOpenAIResponse(chunk, state) {
           isThought ? reasoningDelta(part.text) : { content: part.text },
           null
         ));
+        if (!isThought) state.hasEmittedContent = true;
       }
 
       // Function call
@@ -98,6 +100,7 @@ export function geminiToOpenAIResponse(chunk, state) {
       // Inline data (images)
       const inlineData = part.inlineData || part.inline_data;
       if (inlineData?.data) {
+        state.hasEmittedContent = true;
         const mimeType = inlineData.mimeType || inlineData.mime_type || DEFAULT_IMAGE_MIME;
         results.push(buildChunk(
           chunkMeta(state),
@@ -144,6 +147,15 @@ export function geminiToOpenAIResponse(chunk, state) {
     let finishReason = toOpenAIFinish(candidate.finishReason, "gemini");
     if (finishReason === OPENAI_FINISH.STOP && state.geminiToolCallCount > 0) {
       finishReason = OPENAI_FINISH.TOOL_CALLS;
+    }
+
+    // If stream is closing without any text content or tool calls emitted,
+    // (even if reasoning/thinking was emitted), emit a synthetic whitespace/text chunk.
+    // Modern AI SDKs (e.g. Vercel AI SDK in Kilo) reject responses with APIEmptyResponseError
+    // when a stream finishes with ONLY thinking tokens and zero text/tool content.
+    if (!state.hasEmittedContent && state.geminiToolCallCount === 0) {
+      results.push(buildChunk(chunkMeta(state), { content: "\n" }, null));
+      state.hasEmittedContent = true;
     }
     
     const finalChunk = buildChunk(chunkMeta(state), {}, finishReason);
