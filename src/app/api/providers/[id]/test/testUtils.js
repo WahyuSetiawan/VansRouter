@@ -2,7 +2,7 @@ import { getProviderConnectionById, updateProviderConnection } from "@/lib/local
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
 import { testProxyUrl } from "@/lib/network/proxyTest";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/shared/constants/providers";
-import { getDefaultModel } from "open-sse/config/providerModels.js";
+import { getDefaultModel, getModelUpstreamId } from "open-sse/config/providerModels.js";
 import { resolveOllamaLocalHost, PROVIDERS } from "open-sse/config/providers.js";
 import {
   refreshProviderCredentials,
@@ -22,6 +22,7 @@ import { buildClineHeaders } from "@/shared/utils/clineAuth";
 import { validateAgentRouterConnection } from "open-sse/executors/agentrouter.js";
 import { getKimchiUserAgent } from "open-sse/utils/kimchiUserAgent.js";
 import { assertValidKiroRegion } from "open-sse/config/awsRegion.js";
+import { deriveValidateUrl } from "open-sse/providers/schema.js";
 
 // OAuth provider test endpoints
 const OAUTH_TEST_CONFIG = {
@@ -96,6 +97,7 @@ const OAUTH_TEST_CONFIG = {
     authPrefix: "Bearer ",
   },
   "codebuddy-cn": { tokenExists: true },
+  "codebuddy-intl": { tokenExists: true },
   kimchi: {
     url: KIMCHI_CONFIG.validationUrl,
     method: "GET",
@@ -852,11 +854,27 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
         return { valid: res.ok, error: res.ok ? null : "Invalid API key" };
       }
       case "blackbox": {
-        const baseUrl = PROVIDERS["blackbox"]?.baseUrl?.replace(/\/chat\/completions$/, "") || "https://api.blackbox.ai/v1";
-        const res = await fetchWithConnectionProxy(`${baseUrl}/models`, {
-          headers: { Authorization: `Bearer ${connection.apiKey}` },
+        const baseUrl = PROVIDERS["blackbox"]?.baseUrl || "https://api.blackbox.ai/v1/chat/completions";
+        const probeModel = getModelUpstreamId("blackbox", "gpt-5.4") || "blackboxai/openai/gpt-5.4";
+        const res = await fetchWithConnectionProxy(baseUrl, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${connection.apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: probeModel,
+            messages: [{ role: "user", content: "ping" }],
+            max_tokens: 1,
+            stream: false,
+          }),
         }, effectiveProxy);
-        return { valid: res.ok, error: res.ok ? null : "Invalid API key" };
+        const valid = res.ok || res.status === 400;
+        let error = null;
+        if (!valid) {
+          error = (res.status === 401 || res.status === 403) ? "Invalid API key" : `Blackbox probe failed (${res.status})`;
+        }
+        return { valid, error };
       }
       case "agentrouter": {
         const valid = await validateAgentRouterConnection(
@@ -865,8 +883,21 @@ async function testApiKeyConnection(connection, effectiveProxy = null) {
         );
         return { valid, error: valid ? null : "Invalid API key" };
       }
-      default:
+      default: {
+        // Generic probe using validateUrl or baseUrl from registry
+        const cfg = PROVIDERS[connection.provider];
+        const probeUrl = deriveValidateUrl(cfg);
+        if (probeUrl && connection.apiKey) {
+          // Mirror executors/default.js setAuth: bearer scheme → "Bearer <key>", else raw key.
+          const authHeader = cfg?.auth?.header || "Authorization";
+          const authScheme = (!cfg?.auth || cfg.auth.scheme === "bearer") ? "Bearer " : "";
+          const res = await fetchWithConnectionProxy(probeUrl, {
+            headers: { [authHeader]: `${authScheme}${connection.apiKey}` },
+          }, effectiveProxy);
+          return { valid: res.ok, error: res.ok ? null : "Invalid API key" };
+        }
         return { valid: false, error: "Provider test not supported" };
+      }
     }
   } catch (err) {
     return { valid: false, error: err.message };

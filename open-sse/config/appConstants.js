@@ -73,9 +73,6 @@ export const CLIENT_METADATA = {
 // Internal anti-loop header
 export const INTERNAL_REQUEST_HEADER = { name: "x-request-source", value: "local" };
 
-// Suffix added to client tools when forwarding to Antigravity provider (anti-ban cloaking)
-export const AG_TOOL_SUFFIX = "_ide";
-
 // Suffix added to client tools when forwarding to Claude provider (anti-ban cloaking)
 export const CLAUDE_TOOL_SUFFIX = "_ide";
 
@@ -104,31 +101,6 @@ export const CC_DEFAULT_TOOLS = new Set([
   "ExitPlanMode",
 ]);
 
-// AG native default tools — kept as decoys with neutral description/properties
-// These names must match exactly what AG sends in the real request log
-export const AG_DEFAULT_TOOLS = new Set([
-  "browser_subagent",
-  "command_status",
-  "find_by_name",
-  "generate_image",
-  "grep_search",
-  "list_dir",
-  "list_resources",
-  "multi_replace_file_content",
-  "notify_user",
-  "read_resource",
-  "read_terminal",
-  "read_url_content",
-  "replace_file_content",
-  "run_command",
-  "search_web",
-  "send_command_input",
-  "task_boundary",
-  "view_content_chunk",
-  "view_file",
-  "write_to_file"
-]);
-
 // Antigravity chat/stream headers
 export const ANTIGRAVITY_PRE_RESPONSE_TIMEOUT_CODE = "PRE_RESPONSE_TIMEOUT";
 export const ANTIGRAVITY_HEADERS = {
@@ -137,8 +109,16 @@ export const ANTIGRAVITY_HEADERS = {
 
 // Cloud Code Assist API
 export const CLOUD_CODE_API = {
-  loadCodeAssist: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
-  onboardUser: "https://cloudcode-pa.googleapis.com/v1internal:onboardUser",
+  "gemini-cli": {
+    loadCodeAssist: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+    onboardUser: "https://cloudcode-pa.googleapis.com/v1internal:onboardUser",
+  },
+  // Project discovery (loadCodeAssist/onboardUser) stays on PROD — the daily host
+  // rejects these auth/onboarding calls. Only chat traffic uses the daily host
+  antigravity: {
+    loadCodeAssist: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+    onboardUser: "https://cloudcode-pa.googleapis.com/v1internal:onboardUser",
+  },
 };
 
 export const LOAD_CODE_ASSIST_HEADERS = {
@@ -146,6 +126,13 @@ export const LOAD_CODE_ASSIST_HEADERS = {
   "User-Agent": "google-api-nodejs-client/9.15.1",
   "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
   "Client-Metadata": JSON.stringify({ ideType: IDE_TYPE.ANTIGRAVITY, platform: getPlatformEnum(), pluginType: PLUGIN_TYPE.GEMINI }),
+};
+
+// Real Antigravity IDE doesn't send X-Goog-Api-Client/Client-Metadata on loadCodeAssist/onboardUser —
+// Google's backend fingerprints those and silently refuses to provision a cloudaicompanionProject.
+export const ANTIGRAVITY_LOAD_CODE_ASSIST_HEADERS = {
+  "Content-Type": "application/json",
+  "User-Agent": ANTIGRAVITY_IDE_USER_AGENT,
 };
 
 export const LOAD_CODE_ASSIST_METADATA = {
